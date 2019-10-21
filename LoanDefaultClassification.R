@@ -1,14 +1,22 @@
-library(dplyr)
+library(car) # vif
+library(ROCR) # AUC & ROC
+library(dplyr) # data wrangling
+library(caret) # varImp, confusion matrix
 library(tidyr) # separate
+library(tibble) # add_column
 library(stringr) # str_remove_all
 library(lubridate) # dmy
 library(data.table) # fread
 
+# Setup ----
 # https://www.kaggle.com/c/loan-default-prediction/data
 full_data <- fread("vehicle_loan_default_train.csv")
 
 # Set seed for reproducibility
 set.seed(123)
+
+# Set training/test split
+split <- 0.8
 
 # Select needed variables, make new features and shuffle
 data <- full_data %>% 
@@ -16,7 +24,9 @@ data <- full_data %>%
          everything(),
          -SUPPLIER_ID,
          -UNIQUEID,
-         -CURRENT_PINCODE_ID) %>% 
+         -CURRENT_PINCODE_ID,
+         -MOBILENO_AVL_FLAG,
+         -STATE_ID) %>% 
   mutate(age = (dmy(DISBURSAL_DATE) - dmy(DATE_OF_BIRTH)) / 365.2422,
          avg_account_age = str_remove_all(AVERAGE_ACCT_AGE,
                                           paste(c("yrs", "mon"),
@@ -39,8 +49,10 @@ data <- full_data %>%
          -AVERAGE_ACCT_AGE,
          -CREDIT_HISTORY_LENGTH,
          -avg_account_age_years:-credit_length_months) %>% 
+  filter(MANUFACTURER_ID != 156) %>% 
   sample_frac()
 
+# Making training and test sets ----
 # Make model matrix for modeling
 mm <- model.matrix(LOAN_DEFAULT ~
                      DISBURSED_AMOUNT +
@@ -49,8 +61,6 @@ mm <- model.matrix(LOAN_DEFAULT ~
                      factor(BRANCH_ID) +
                      factor(MANUFACTURER_ID) +
                      factor(EMPLOYMENT_TYPE) +
-                     factor(STATE_ID) +
-                     MOBILENO_AVL_FLAG +
                      AADHAR_FLAG +
                      PAN_FLAG +
                      VOTERID_FLAG +
@@ -78,4 +88,146 @@ mm <- model.matrix(LOAN_DEFAULT ~
                      age +
                      avg_account_age +
                      credit_length,
-                   data = data)
+                   data = data)[, -1]
+
+# Make training and test sets
+training <- mm %>% 
+  as_tibble() %>% 
+  filter(row_number() < n() / (1 / split)) %>% 
+  as.matrix()
+
+test <- mm %>% 
+  as_tibble() %>% 
+  filter(row_number() >= n() / (1 / split)) %>% 
+  as.matrix()
+
+# Make targets for both sets
+training_target <- data %>% 
+  filter(row_number() < n() / (1 / split)) %>% 
+  pull(LOAN_DEFAULT)
+
+test_target <- data %>% 
+  filter(row_number() >= n() / (1 / split)) %>% 
+  pull(LOAN_DEFAULT)
+
+training_filtered <- training %>% 
+  as_tibble() %>% 
+  add_column(LOAN_DEFAULT = training_target, .after = 0) %>% 
+  select(-ASSET_COST,
+         -PRI_SANCTIONED_AMOUNT,
+         -SEC_CURRENT_BALANCE,
+         -SEC_SANCTIONED_AMOUNT,
+         -PERFORM_CNS_SCORE)
+
+test_filtered <- test %>% 
+  as_tibble() %>% 
+  select(-ASSET_COST,
+         -PRI_SANCTIONED_AMOUNT,
+         -SEC_CURRENT_BALANCE,
+         -SEC_SANCTIONED_AMOUNT,
+         -PERFORM_CNS_SCORE)
+
+# Functions ----
+# Function for getting optimal cutoff where sensitivity == specificity
+calculate_cutoff <- function(probability, target){
+  # Calculate sensitivities and specificities to find optimal cutoff
+  depth <- 1000
+  temp <- as_tibble(matrix(nrow = depth, ncol = 2))
+  for(i in 1:depth){
+    temp_pred <- as.numeric(probability > i / depth)
+    temp_confidence <- confusionMatrix(temp_pred %>% as.factor(),
+                                       target) %>% 
+      suppressWarnings()
+    # Keep only the sensitivity and specificity
+    temp[i, ] <- temp_confidence$byClass[c(1, 2)] %>% unname()
+    
+  }
+  # Name the columns
+  colnames(temp) <- temp_confidence$byClass[c(1, 2)] %>% names()
+  
+  # Find the optimal cutoff by minimizing the distance between the two
+  ts.plot(temp)
+  cutoff <- which.min(abs(temp$Sensitivity - temp$Specificity)) / depth
+  
+  return(cutoff)
+}
+
+# Function for calculating AUC and plotting ROC curves
+get_auc_plot_roc <- function(probability, target){
+  temp_roc <- prediction(probability, target)
+  temp_perf <- performance(temp_roc, "tpr", "fpr")
+  plot(temp_perf)
+  lines(c(0, 1), c(0, 1))
+  print(performance(temp_roc, "auc")@y.values[[1]])
+}
+
+# Function for scaling and plotting variable importances
+plot_importances <- function(model){
+  # XGBoost returns different varImp object
+  if(class(varImp(model)) == "varImp.train"){
+    model <- varImp(model)$importance
+  } else {
+    model <- varImp(model)
+  }
+  
+  # Format and arrange, filter out certain categorical variable levels
+  varimp <- model %>% 
+    mutate(Feature = row.names(.),
+           Importance = as.numeric(Overall)) %>%
+    select(-Overall) %>%
+    arrange(-Importance) %>% 
+    mutate(Feature = gsub("factor(", "", .$Feature, fixed = TRUE)) %>%
+    mutate(Feature = gsub(")", "", .$Feature, fixed = TRUE)) %>% 
+    mutate(Importance = (Importance - min(Importance)) /
+             (max(Importance) - min(Importance))) %>% 
+    arrange(-Importance) %>% 
+    filter(!str_detect(Feature, "BRANCH_ID"))
+  
+  # Plot from most important to least important
+  varimp %>% 
+    ggplot(aes(x = reorder(.$Feature, .$Importance),
+               y = Importance)) +
+    geom_col() +
+    xlab("") +
+    coord_flip()
+}
+
+# Modeling ----
+# Make logistic regression model
+logistic <- glm(LOAN_DEFAULT ~ .,
+                family = "binomial",
+                data = training_filtered)
+
+# Check for multicollinearity
+logistic %>% vif %>% View()
+
+# Make predictions for training and test sets
+logistic_training_response <- predict(logistic,
+                                      newdata = training_filtered,
+                                      type = "response")
+
+logistic_test_response <- predict(logistic,
+                                  newdata = test_filtered,
+                                  type = "response")
+
+# Get the optimal cutoff using training set
+logistic_cutoff <- calculate_cutoff(logistic_training_response,
+                                    training_target)
+
+# Make confusion matrices and get accuracy measures
+logistic_conf_train <- confusionMatrix(
+  as.numeric(logistic_training_response >
+               logistic_cutoff) %>% as.factor(),
+  training_target)
+
+# Use the cutoff from training set for test set
+logistic_conf_test <- confusionMatrix(
+  as.numeric(logistic_test_response >
+               logistic_cutoff) %>% as.factor(),
+  test_target)
+
+# Get AUC and plot ROC curve for test set
+get_auc_plot_roc(logistic_test_response, test_target)
+
+# Plot variable importances
+plot_importances(logistic)
