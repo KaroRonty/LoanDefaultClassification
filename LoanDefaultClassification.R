@@ -110,6 +110,7 @@ test_target <- data %>%
   filter(row_number() >= n() / (1 / split)) %>% 
   pull(LOAN_DEFAULT)
 
+# Filter highly correlated variables from the logistic regression
 training_filtered <- training %>% 
   as_tibble() %>% 
   add_column(LOAN_DEFAULT = training_target, .after = 0) %>% 
@@ -192,14 +193,14 @@ plot_importances <- function(model){
     coord_flip()
 }
 
-# Modeling ----
+# Logistic regression ----
 # Make logistic regression model
 logistic <- glm(LOAN_DEFAULT ~ .,
                 family = "binomial",
                 data = training_filtered)
 
 # Check for multicollinearity
-logistic %>% vif %>% View()
+logistic %>% vif() %>% View()
 
 # Make predictions for training and test sets
 logistic_training_response <- predict(logistic,
@@ -231,3 +232,27 @@ get_auc_plot_roc(logistic_test_response, test_target)
 
 # Plot variable importances
 plot_importances(logistic)
+
+# XGBoost ----
+# Cross validation
+trControl <- trainControl(method = "repeatedcv",
+                          number = 10,
+                          repeats = 3)
+
+# Hyperparameter grid
+tuneGrid <- expand.grid(nrounds = 100,
+                        max_depth = c(3, 6, 12),
+                        eta = 0.1,
+                        gamma = c(0, 5),
+                        colsample_bytree = c(0.5, 0.8, 1),
+                        min_child_weight = c(1, 5),
+                        subsample = c(0.5, 0.8, 1))
+
+time <- Sys.time()
+xgb <- train(x = training,
+             y = training_target,
+             method = "xgbTree",
+             objective = "binary:logistic",
+             trControl = trControl,
+             tuneGrid = tuneGrid)
+(time <- Sys.time() - time)
