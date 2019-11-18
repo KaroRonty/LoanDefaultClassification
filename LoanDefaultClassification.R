@@ -1,15 +1,16 @@
 library(car) # vif
 library(ROCR) # AUC & ROC
+library(e1071) # statistics
 library(dplyr) # data wrangling
 library(caret) # varImp, confusion matrix
 library(tidyr) # separate
 library(tibble) # add_column
+library(xgboost) # caret requires
 library(stringr) # str_remove_all
 library(lubridate) # dmy
 library(data.table) # fread
 
 # Setup ----
-# https://www.kaggle.com/c/loan-default-prediction/data
 full_data <- fread("vehicle_loan_default_train.csv")
 
 # Set seed for reproducibility
@@ -38,7 +39,7 @@ data <- full_data %>%
   separate(avg_account_age, c("avg_account_age_years",
                               "avg_account_age_months")) %>% 
   separate(credit_length, c("credit_length_years",
-                              "credit_length_months")) %>% 
+                            "credit_length_months")) %>% 
   mutate(avg_account_age = as.numeric(avg_account_age_years) +
            as.numeric(avg_account_age_months) / 12,
          credit_length = as.numeric(credit_length_years) +
@@ -219,13 +220,15 @@ logistic_cutoff <- calculate_cutoff(logistic_training_response,
 logistic_conf_train <- confusionMatrix(
   as.numeric(logistic_training_response >
                logistic_cutoff) %>% as.factor(),
-  training_target)
+  training_target,
+  positive = "1")
 
 # Use the cutoff from training set for test set
 logistic_conf_test <- confusionMatrix(
   as.numeric(logistic_test_response >
                logistic_cutoff) %>% as.factor(),
-  test_target)
+  test_target,
+  positive = "1")
 
 # Get AUC and plot ROC curve for test set
 get_auc_plot_roc(logistic_test_response, test_target)
@@ -241,18 +244,54 @@ trControl <- trainControl(method = "repeatedcv",
 
 # Hyperparameter grid
 tuneGrid <- expand.grid(nrounds = 100,
-                        max_depth = c(3, 6, 12),
+                        max_depth = 6,
                         eta = 0.1,
-                        gamma = c(0, 5),
-                        colsample_bytree = c(0.5, 0.8, 1),
-                        min_child_weight = c(1, 5),
-                        subsample = c(0.5, 0.8, 1))
+                        gamma = 5,
+                        colsample_bytree = 0.8,
+                        min_child_weight = 1,
+                        subsample = 1)
 
+
+# Make XGBoost model
+#1.5 h on 4 cores without grid search
 time <- Sys.time()
-xgb <- train(x = training,
-             y = training_target,
-             method = "xgbTree",
-             objective = "binary:logistic",
-             trControl = trControl,
-             tuneGrid = tuneGrid)
+xgboost <- train(x = training,
+                 y = training_target,
+                 method = "xgbTree",
+                 objective = "binary:logistic",
+                 trControl = trControl,
+                 tuneGrid = tuneGrid)
 (time <- Sys.time() - time)
+
+# Make predictions for training and test sets
+xgboost_training_response <- predict(xgboost,
+                                     newdata = training,
+                                     type = "prob")$`1`
+
+xgboost_test_response <- predict(xgboost,
+                                 newdata = test,
+                                 type = "prob")$`1`
+
+# Get the optimal cutoff using training set
+xgboost_cutoff <- calculate_cutoff(xgboost_training_response,
+                                   training_target)
+
+# Make confusion matrices and get accuracy measures
+xgboost_conf_train <- confusionMatrix(
+  as.numeric(xgboost_training_response >
+               xgboost_cutoff) %>% as.factor(),
+  training_target,
+  positive = "1")
+
+# Use the cutoff from training set for test set
+xgboost_conf_test <- confusionMatrix(
+  as.numeric(xgboost_test_response >
+               xgboost_cutoff) %>% as.factor(),
+  test_target,
+  positive = "1")
+
+# Get AUC and plot ROC curve for test set
+get_auc_plot_roc(xgboost_test_response, test_target)
+
+# Plot variable importances
+plot_importances(xgboost)
